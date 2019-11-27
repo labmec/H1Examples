@@ -20,12 +20,18 @@
 #endif
 #include <Pre/pzgengrid.h>
 #include <pzintel.h>
-
+#include <pzshapelinear.h>//in order to adjust the polynomial family to be used
+#include <TPZCompMeshTools.h>
 #include <string>
+#include <Mesh/pzcondensedcompel.h>
 
 
 enum EElementType {
     ETriangular = 0, ESquare = 1, ETrapezoidal = 2
+};
+
+enum EOrthogonalFuncs{
+    EChebyshev = 0,EExpo = 1,ELegendre = 2 ,EJacobi = 3,EHermite = 4
 };
 
 /**
@@ -43,16 +49,31 @@ TPZGeoMesh *CreateGeoMesh(const int dim, int nelx, int nely, EElementType meshTy
 /**
 * Generates a computational mesh that implements the problem to be solved
 */
-static TPZCompMesh *CreateCompMesh(TPZGeoMesh *gmesh, const TPZVec<int> &matIds, const int initialPOrder);
+static TPZCompMesh *CreateCompMesh(TPZGeoMesh *gmesh, const TPZVec<int> &matIds, const int initialPOrder, EOrthogonalFuncs family);
 
 /**
- * This method will perform the P refinement on certain elements.
+ * This method will perform the P refinement on certain elements (adaptive P refinement).
  * These elements are the ones whose error exceed a given percentage of the maximum error in the mesh.
  */
-void PerformPRefinement(TPZCompMesh *cMesh, TPZAnalysis &an, const REAL errorPercentage);
+void PerformAdapativePRefinement(TPZCompMesh *cMesh, TPZAnalysis &an, const REAL errorPercentage);
+
+/**
+ * This method will perform uniform P refinement, i.e., all elements will have their polynomial order increased
+ */
+void PerformUniformPRefinement(TPZCompMesh *cmesh, TPZAnalysis &an);
+
+/**
+ * This method is responsible to removing the equation corresponding to dirichlet boundary conditions. Used
+ * if one desires to analyse the condition number of the resultant matrix
+ */
+void FilterBoundaryEquations(TPZCompMesh *cmesh, TPZVec<int64_t> &activeEquations, int64_t &neq,
+                             int64_t &neqOriginal);
 
 int main(int argc, char **argv)
 {
+    #ifdef LOG4CXX
+    InitializePZLOG();
+    #endif
     constexpr int numthreads{8};//number of threads to be used throughout the program
     #ifdef USING_MKL
     mkl_set_dynamic(0); // disable automatic adjustment of the number of threads
@@ -60,14 +81,37 @@ int main(int argc, char **argv)
     #endif
 
     constexpr int dim{2};//physical dimension of the problem
-    constexpr int nDiv{50};//number of divisions of each direction (x, y) of the domain
+    constexpr int nDiv{10};//number of divisions of each direction (x, y) of the domain
     constexpr int initialPOrder{1};//initial polynomial order
     //this will set how many rounds of refinements will be performed
-    constexpr int nPRefinements{10};
+    constexpr int nPRefinements{9};
+    //whether to perform adaptive or uniform p-refinement
+    constexpr bool adaptiveP = true;
     //once the element with the maximum error is found, elements with errors bigger than
-    //the following percentage will be refined as well
+    //the following percentage will be refined as well (if adaptiveP == true)
     constexpr REAL errorPercentage{0.3};
-    std::string plotfile= "solution.vtk";//where to print the vtk files
+    //whether to apply static condensation on the internal dofs
+    constexpr bool condense{false};
+    //whether to remove the dirichlet boundary conditions from the matrix
+    constexpr bool filterBoundaryEqs{true};
+    //which family of polynomials to use
+    EOrthogonalFuncs orthogonalPolyFamily = EChebyshev;//EChebyshev = 0,EExpo = 1,ELegendre = 2 ,EJacobi = 3,EHermite = 4
+    //whether to export the stiffness matrix
+    constexpr bool exportMatrix{true};
+    //which format to export the matrix RECOMMENDED ->>>>>>>>  ECSV or EMathematicaInput
+    constexpr MatrixOutputFormat matrixFormat = ECSV;
+    //whether to generate .vtk files
+    constexpr bool postProcess{true};
+
+    const std::string executionInfo = [&](){
+            std::string name("");
+            if(adaptiveP) name.append("_adapP");
+            else name.append("_unifP");
+            name.append("_nPrefs");
+            name.append(std::to_string(nPRefinements));
+            return name;
+    }();
+    const std::string plotfile = "solution"+executionInfo+".vtk";//where to print the vtk files
     constexpr int postProcessResolution{2};
 
     /** In NeoPZ, the TPZMaterial classes are used to implement the weak statement of the differential equation,
@@ -78,7 +122,7 @@ int main(int argc, char **argv)
     TPZVec<int> matIdVec;
     TPZGeoMesh *gMesh = CreateGeoMesh(dim,nDiv,nDiv,ETriangular,matIdVec);
     //creates computational mesh
-    TPZCompMesh *cMesh = CreateCompMesh(gMesh,matIdVec,initialPOrder);
+    TPZCompMesh *cMesh = CreateCompMesh(gMesh,matIdVec,initialPOrder, orthogonalPolyFamily);
 
     //Setting up the analysis object
     constexpr bool optimizeBandwidth{true};
@@ -127,28 +171,52 @@ int main(int argc, char **argv)
     scalnames.Push("Error");//print the error of each element
     //resize the matrix that will store the error for each element
     cMesh->ElementSolution().Resize(cMesh->NElements(),3);
-    for(auto it = 0 ; it < nPRefinements; it++){
+    TPZVec<int64_t> activeEquations;
+    for(auto it = 0 ; it < nPRefinements + 1; it++){
         std::cout<<"============================"<<std::endl;
-        std::cout<<"\tIteration "<<it+1<<" out of "<<nPRefinements<<std::endl;
-        std::cout<<"\tAssemble matrix with NDoF = "<<cMesh->NEquations()<<"."<<std::endl;
+        std::cout<<"\tIteration "<<it+1<<" out of "<<nPRefinements + 1<<std::endl;
+        if(condense) TPZCompMeshTools::CreatedCondensedElements(cMesh,false,false);
+        if(filterBoundaryEqs){
+            int64_t neqOriginal = -1, neqReduced = -1;
+            activeEquations.Resize(0);
+            FilterBoundaryEquations(cMesh,activeEquations, neqReduced, neqOriginal);
+            an.StructMatrix()->EquationFilter().Reset();
+            an.StructMatrix()->EquationFilter().SetNumEq(cMesh->NEquations());
+            an.StructMatrix()->EquationFilter().SetActiveEquations(activeEquations);
+        }else{
+            an.StructMatrix()->EquationFilter().SetNumEq(cMesh->NEquations());
+        }
         an.SetCompMesh(cMesh,optimizeBandwidth);
+        std::cout<<"\tAssembling matrix with NDoF = "<<an.StructMatrix()->EquationFilter().NActiveEquations()<<"."<<std::endl;
         an.Assemble(); //Assembles the global stiffness matrix (and load vector)
         std::cout<<"\tAssemble finished."<<std::endl;
+        if(exportMatrix){
+            const std::string matFileName = "matrix"+executionInfo+[&](){
+                std::string name("_it"+std::to_string(it));
+                if(matrixFormat == ECSV) return name + ".csv";
+                else return name + ".nb";
+            }();//where to print the matrix files
+            std::ofstream matFile(matFileName);
+            an.Solver().Matrix()->Print("will_be_ignored",matFile,ECSV);
+        }
         an.Solve();
 
         std::cout<<"\tCalculating errors..."<<std::endl;
         TPZVec<REAL> errorVec(3,0);
         an.PostProcessError(errorVec,true);
         std::cout<<"############"<<std::endl;
-
-        std::cout<<"\tPost processing..."<<std::endl;
-        an.DefineGraphMesh(dim, scalnames, vecnames, plotfile);
-        an.SetStep(it);
-        an.PostProcess(postProcessResolution);
-        std::cout<<"\tPost processing finished."<<std::endl;
-        if(it < nPRefinements - 1){
-            PerformPRefinement(cMesh, an, errorPercentage);
+        if(postProcess){
+            std::cout<<"\tPost processing..."<<std::endl;
+            an.DefineGraphMesh(dim, scalnames, vecnames, plotfile);
+            an.SetStep(it);
+            an.PostProcess(postProcessResolution);
+            std::cout<<"\tPost processing finished."<<std::endl;
         }
+        if(it < nPRefinements){
+            if(adaptiveP)   PerformAdapativePRefinement(cMesh, an, errorPercentage);
+            else PerformUniformPRefinement(cMesh,an);
+        }
+        if(condense) TPZCompMeshTools::UnCondensedElements(cMesh);
     }
     delete cMesh;
     delete gMesh;
@@ -207,7 +275,7 @@ TPZGeoMesh *CreateGeoMesh(const int dim, int nelx, int nely, EElementType meshTy
     return gmesh;
 }
 
-TPZCompMesh *CreateCompMesh(TPZGeoMesh *gmesh, const TPZVec<int> &matIds, const int initialPOrder){
+TPZCompMesh *CreateCompMesh(TPZGeoMesh *gmesh, const TPZVec<int> &matIds, const int initialPOrder, EOrthogonalFuncs familyType){
     TPZCompMesh *cmesh = new TPZCompMesh(gmesh);
 
     //Definition of the approximation space
@@ -261,12 +329,31 @@ TPZCompMesh *CreateCompMesh(TPZGeoMesh *gmesh, const TPZVec<int> &matIds, const 
     cmesh->AutoBuild();
     cmesh->AdjustBoundaryElements();
     cmesh->CleanUpUnconnectedNodes();
+
+    switch(familyType){
+        case EChebyshev:
+            pzshape::TPZShapeLinear::fOrthogonal =  pzshape::TPZShapeLinear::Chebyshev;
+            break;
+        case EExpo:
+            pzshape::TPZShapeLinear::fOrthogonal =  pzshape::TPZShapeLinear::Expo;
+            break;
+        case ELegendre:
+            pzshape::TPZShapeLinear::fOrthogonal =  pzshape::TPZShapeLinear::Legendre;
+            break;
+        case EJacobi:
+            pzshape::TPZShapeLinear::fOrthogonal =  pzshape::TPZShapeLinear::Jacobi;
+            break;
+        case EHermite:
+            pzshape::TPZShapeLinear::fOrthogonal =  pzshape::TPZShapeLinear::Hermite;
+            break;
+    }
+
     return cmesh;
 }
 
-void PerformPRefinement(TPZCompMesh *cmesh, TPZAnalysis &an,
+void PerformAdapativePRefinement(TPZCompMesh *cmesh, TPZAnalysis &an,
                         const REAL errorPercentage) {
-    std::cout<<"\tPerforming p-refinement..."<<std::endl;
+    std::cout<<"\tPerforming adaptive p-refinement..."<<std::endl;
     const auto nElems = cmesh->Reference()->NElements();
     // Iterates through element errors to get the maximum value
     REAL maxError = -1;
@@ -281,12 +368,20 @@ void PerformPRefinement(TPZCompMesh *cmesh, TPZAnalysis &an,
     }
     std::cout<<"\tMax error found (in one element): "<<maxError<<std::endl;
     // Refines elements which errors are bigger than 30% of the maximum error
-    REAL threshold = errorPercentage * maxError;
+    const REAL threshold = errorPercentage * maxError;
     int count = 0;
     for (int64_t iel = 0; iel < nElems; iel++) {
-        auto cel =  dynamic_cast<TPZInterpolationSpace *> (cmesh->Element(iel));
+        auto cel =  [&](){
+            auto cel1 = dynamic_cast<TPZInterpolationSpace *> (cmesh->Element(iel));
+            if(cel1) return cel1;
+            auto cel2 = dynamic_cast<TPZCondensedCompEl*> (cmesh->Element(iel));
+            if(!cel2) return (TPZInterpolationSpace *)nullptr;
+            auto cel3 = dynamic_cast<TPZInterpolationSpace *> (cel2->ReferenceCompEl());
+            return cel3;
+        }();
         if (!cel || cel->Dimension() != cmesh->Dimension()) continue;
-        REAL elementError = cmesh->ElementSolution()(iel, 0);
+        auto celIndex = cel->Index();
+        REAL elementError = cmesh->ElementSolution()(celIndex, 0);
         if (elementError > threshold) {
             const int currentPorder = cel->GetPreferredOrder();
             cel->PRefine(currentPorder+1);
@@ -297,6 +392,77 @@ void PerformPRefinement(TPZCompMesh *cmesh, TPZAnalysis &an,
     cmesh->AdjustBoundaryElements();
     cmesh->CleanUpUnconnectedNodes();
     cmesh->ExpandSolution();
-    const auto neqNew = cmesh->NEquations();
-    an.StructMatrix()->EquationFilter().SetNumEq(neqNew);
+}
+
+void PerformUniformPRefinement(TPZCompMesh *cmesh, TPZAnalysis &an) {
+    std::cout<<"\tPerforming uniform p-refinement..."<<std::endl;
+    const auto nElems = cmesh->Reference()->NElements();
+    int count = 0;
+    for (int64_t iel = 0; iel < nElems; iel++) {
+        auto cel =  [&](){
+            auto cel1 = dynamic_cast<TPZInterpolationSpace *> (cmesh->Element(iel));
+            if(cel1) return cel1;
+            auto cel2 = dynamic_cast<TPZCondensedCompEl*> (cmesh->Element(iel));
+            if(!cel2) return (TPZInterpolationSpace *)nullptr;
+            auto cel3 = dynamic_cast<TPZInterpolationSpace *> (cel2->ReferenceCompEl());
+            return cel3;
+        }();
+        if (!cel || cel->Dimension() != cmesh->Dimension()) continue;
+        const int currentPorder = cel->GetPreferredOrder();
+        cel->PRefine(currentPorder+1);
+        count++;
+    }
+    std::cout<<"\t"<<count<<" elements were refined in this step."<<std::endl;
+    cmesh->AdjustBoundaryElements();
+    cmesh->CleanUpUnconnectedNodes();
+    cmesh->ExpandSolution();
+}
+
+void FilterBoundaryEquations(TPZCompMesh *cmesh, TPZVec<int64_t> &activeEquations, int64_t &neq,
+                                                 int64_t &neqOriginal) {
+    neqOriginal = cmesh->NEquations();
+    neq = 0;
+
+    std::cout << "Filtering boundary equations..." << std::endl;
+    TPZManVector<int64_t, 1000> allConnects;
+    std::set<int64_t> boundConnects;
+
+    for (auto iel = 0; iel < cmesh->NElements(); iel++) {
+        TPZCompEl *cel = cmesh->ElementVec()[iel];
+        if (cel == nullptr || cel->Reference() == nullptr) {
+            continue;
+        }
+        TPZBndCond *mat = dynamic_cast<TPZBndCond *>(cmesh->MaterialVec()[cel->Reference()->MaterialId()]);
+
+        //dirichlet boundary condition
+        if (mat && mat->Type() == 0) {
+            std::set<int64_t> boundConnectsEl;
+            cel->BuildConnectList(boundConnectsEl);
+
+            for (auto val : boundConnectsEl) {
+                if (boundConnects.find(val) == boundConnects.end()) {
+                    boundConnects.insert(val);
+                }
+            }
+        }
+    }
+
+    for (auto iCon = 0; iCon < cmesh->NConnects(); iCon++) {
+        if (boundConnects.find(iCon) == boundConnects.end()) {
+            TPZConnect &con = cmesh->ConnectVec()[iCon];
+            if(con.IsCondensed()) continue;
+            int seqnum = con.SequenceNumber();
+            int pos = cmesh->Block().Position(seqnum);
+            int blocksize = cmesh->Block().Size(seqnum);
+            if (blocksize == 0) continue;
+            int vs = activeEquations.size();
+            activeEquations.Resize(vs + blocksize);
+            for (int ieq = 0; ieq < blocksize; ieq++) {
+                activeEquations[vs + ieq] = pos + ieq;
+                neq++;
+            }
+        }
+    }
+    std::cout << "# equations(before): " << neqOriginal << std::endl;
+    std::cout << "# equations(after): " << neq << std::endl;
 }
